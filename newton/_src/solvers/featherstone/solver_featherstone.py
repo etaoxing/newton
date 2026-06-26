@@ -326,17 +326,7 @@ class SolverFeatherstone(SolverBase):
             self.articulation_coord_start = wp.array(articulation_coord_start, dtype=wp.int32, device=model.device)
 
     def _allocate_model_aux_vars(self, model):
-        # allocate mass, Jacobian matrices, and other auxiliary variables pertaining to the model
-        if model.joint_count:
-            # system matrices
-            self.M = wp.zeros((self.M_size,), dtype=wp.float32, device=model.device, requires_grad=model.requires_grad)
-            self.J = wp.zeros((self.J_size,), dtype=wp.float32, device=model.device, requires_grad=model.requires_grad)
-            self.P = wp.empty_like(self.J, requires_grad=model.requires_grad)
-            self.H = wp.empty((self.H_size,), dtype=wp.float32, device=model.device, requires_grad=model.requires_grad)
-
-            # zero since only upper triangle is set which can trigger NaN detection
-            self.L = wp.zeros_like(self.H)
-
+        # allocate auxiliary variables pertaining to the model (constant across states)
         if model.body_count:
             self.body_I_m = wp.empty(
                 (model.body_count,), dtype=wp.spatial_matrix, device=model.device, requires_grad=model.requires_grad
@@ -361,6 +351,18 @@ class SolverFeatherstone(SolverBase):
 
     def _allocate_state_aux_vars(self, model, target, requires_grad):
         # allocate auxiliary variables that vary with state
+        if model.joint_count:
+            # system matrices: kept per-state so multi-step autodiff does not alias the
+            # mass matrix and its Cholesky factor across timesteps (the backward pass of
+            # eval_dense_solve_batched reads ``L`` for the step it is differentiating)
+            target.M = wp.zeros((self.M_size,), dtype=wp.float32, device=model.device, requires_grad=requires_grad)
+            target.J = wp.zeros((self.J_size,), dtype=wp.float32, device=model.device, requires_grad=requires_grad)
+            target.P = wp.empty_like(target.J, requires_grad=requires_grad)
+            target.H = wp.empty((self.H_size,), dtype=wp.float32, device=model.device, requires_grad=requires_grad)
+
+            # zero since only upper triangle is set which can trigger NaN detection
+            target.L = wp.zeros_like(target.H)
+
         if model.body_count:
             # joints
             # Generalized joint accelerations solved from H * qdd = tau.
@@ -448,6 +450,10 @@ class SolverFeatherstone(SolverBase):
 
         if not getattr(state_aug, "_featherstone_augmented", False):
             self._allocate_state_aux_vars(model, state_aug, requires_grad)
+        # in autodiff mode the system matrices live on each State, so state_in must also
+        # carry them to source the carry-over when the mass matrix is not rebuilt this step
+        if requires_grad and not getattr(state_in, "_featherstone_augmented", False):
+            self._allocate_state_aux_vars(model, state_in, requires_grad)
         if control is None:
             control = model.control(clone_variables=False)
 
@@ -741,7 +747,7 @@ class SolverFeatherstone(SolverBase):
                                 model.joint_qd_start,
                                 state_aug.joint_S_s,
                             ],
-                            outputs=[self.J],
+                            outputs=[state_aug.J],
                             device=model.device,
                         )
 
@@ -755,17 +761,17 @@ class SolverFeatherstone(SolverBase):
                                 self.articulation_M_start,
                                 state_aug.body_I_s,
                             ],
-                            outputs=[self.M],
+                            outputs=[state_aug.M],
                             device=model.device,
                         )
 
                         if self.use_tile_gemm:
                             # reshape arrays
-                            M_tiled = self.M.reshape((-1, 6 * self.joint_count, 6 * self.joint_count))
-                            J_tiled = self.J.reshape((-1, 6 * self.joint_count, self.dof_count))
+                            M_tiled = state_aug.M.reshape((-1, 6 * self.joint_count, 6 * self.joint_count))
+                            J_tiled = state_aug.J.reshape((-1, 6 * self.joint_count, self.dof_count))
                             R_tiled = self.joint_armature_effective.reshape((-1, self.dof_count))
-                            H_tiled = self.H.reshape((-1, self.dof_count, self.dof_count))
-                            L_tiled = self.L.reshape((-1, self.dof_count, self.dof_count))
+                            H_tiled = state_aug.H.reshape((-1, self.dof_count, self.dof_count))
+                            L_tiled = state_aug.L.reshape((-1, self.dof_count, self.dof_count))
                             assert H_tiled.shape == (model.articulation_count, 18, 18)
                             assert L_tiled.shape == (model.articulation_count, 18, 18)
                             assert R_tiled.shape == (model.articulation_count, 18)
@@ -797,10 +803,10 @@ class SolverFeatherstone(SolverBase):
                                         self.articulation_H_start,
                                         self.articulation_H_rows,
                                         self.articulation_dof_start,
-                                        self.H,
+                                        state_aug.H,
                                         self.joint_armature_effective,
                                     ],
-                                    outputs=[self.L],
+                                    outputs=[state_aug.L],
                                     device=model.device,
                                 )
 
@@ -830,10 +836,10 @@ class SolverFeatherstone(SolverBase):
                                     self.articulation_J_start,
                                     # P start is the same as J start since it has the same dims as J
                                     self.articulation_J_start,
-                                    self.M,
-                                    self.J,
+                                    state_aug.M,
+                                    state_aug.J,
                                 ],
-                                outputs=[self.P],
+                                outputs=[state_aug.P],
                                 device=model.device,
                             )
 
@@ -852,10 +858,10 @@ class SolverFeatherstone(SolverBase):
                                     # P start is the same as J start since it has the same dims as J
                                     self.articulation_J_start,
                                     self.articulation_H_start,
-                                    self.J,
-                                    self.P,
+                                    state_aug.J,
+                                    state_aug.P,
                                 ],
-                                outputs=[self.H],
+                                outputs=[state_aug.H],
                                 device=model.device,
                             )
 
@@ -867,10 +873,10 @@ class SolverFeatherstone(SolverBase):
                                     self.articulation_H_start,
                                     self.articulation_H_rows,
                                     self.articulation_dof_start,
-                                    self.H,
+                                    state_aug.H,
                                     self.joint_armature_effective,
                                 ],
-                                outputs=[self.L],
+                                outputs=[state_aug.L],
                                 device=model.device,
                             )
 
@@ -879,10 +885,16 @@ class SolverFeatherstone(SolverBase):
                         # print("joint_tau:")
                         # print(state_aug.joint_tau.numpy())
                         # print("H:")
-                        # print(self.H.numpy())
+                        # print(state_aug.H.numpy())
                         # print("L:")
-                        # print(self.L.numpy())
+                        # print(state_aug.L.numpy())
                         self._mass_matrix_dirty = False
+                    elif state_aug is not self:
+                        # per-state buffers (autodiff): the mass matrix is not rebuilt this
+                        # step, so carry the previous step's factorization forward into this
+                        # state's buffers (the forward solve and its adjoint read state_aug.L)
+                        wp.copy(state_aug.H, state_in.H)
+                        wp.copy(state_aug.L, state_in.L)
 
                     # solve for qdd
                     state_aug.joint_qdd.zero_()
@@ -893,8 +905,8 @@ class SolverFeatherstone(SolverBase):
                             self.articulation_H_start,
                             self.articulation_H_rows,
                             self.articulation_dof_start,
-                            self.H,
-                            self.L,
+                            state_aug.H,
+                            state_aug.L,
                             state_aug.joint_tau,
                         ],
                         outputs=[
