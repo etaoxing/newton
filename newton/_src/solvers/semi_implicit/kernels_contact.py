@@ -516,7 +516,7 @@ def eval_body_contact(
     fn = d * ke
 
     # contact damping
-    fd = wp.min(vn, 0.0) * kd * wp.step(d)
+    fd = wp.min(vn, 0.0) * kd * wp.step(d) * (-d)
 
     # viscous friction
     # ft = vt*kf
