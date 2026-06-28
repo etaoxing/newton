@@ -530,14 +530,11 @@ def eval_body_contact(
 
     # ft = wp.vec3(vx, 0.0, vz)
 
-    # Coulomb friction (smooth, but gradients are numerically unstable around |vt| = 0)
     ft = wp.vec3(0.0)
     if d < 0.0:
-        # use a smooth vector norm to avoid gradient instability at/around zero velocity
-        vs = wp.norm_huber(vt, delta=friction_smoothing)
-        if vs > 0.0:
-            fr = vt / vs
-            ft = fr * wp.min(kf * vs, -mu * (fn + fd))
+        s = wp.length(vt)
+        if s > 1.0e-6 * friction_smoothing:
+            ft = (vt / s) * wp.min(kf * s, -mu * fn)
 
     f_total = n * (fn + fd) + ft
     # f_total = n * (fn + fd)

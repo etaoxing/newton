@@ -1200,7 +1200,6 @@ def eval_rigid_tau(
         torque_com = wp.spatial_bottom(f_ext_public)
         x_com_s = wp.transform_get_translation(body_q_com[child]) - body_solve_origin[child]
         f_ext = -wp.spatial_vector(force, torque_com + wp.cross(x_com_s, force))
-        body_f_ext[child] = f_ext
         f_s = f_b_s + f_t_s + f_ext
 
         # compute joint-space forces, writes out tau
@@ -2221,11 +2220,16 @@ def compute_body_parent_f(
     """
     tid = wp.tid()
 
-    f_s = body_f_s[tid] + body_ft_s[tid] + body_f_ext[tid]
+    r_com = wp.transform_get_translation(body_q_com[tid]) - body_solve_origin[tid]
+    f_ext_public = body_f_ext[tid]
+    ext_force = wp.spatial_top(f_ext_public)
+    ext_torque_com = wp.spatial_bottom(f_ext_public)
+    f_ext = -wp.spatial_vector(ext_force, ext_torque_com + wp.cross(r_com, ext_force))
+
+    f_s = body_f_s[tid] + body_ft_s[tid] + f_ext
     f_lin = wp.spatial_top(f_s)
     f_ang_at_origin = wp.spatial_bottom(f_s)
 
-    r_com = wp.transform_get_translation(body_q_com[tid]) - body_solve_origin[tid]
     f_ang_at_com = f_ang_at_origin - wp.cross(r_com, f_lin)
 
     body_parent_f[tid] = wp.spatial_vector(f_lin, f_ang_at_com)
