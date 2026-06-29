@@ -369,6 +369,7 @@ def jcalc_tau(
     joint_limit_ke: wp.array[float],
     joint_limit_kd: wp.array[float],
     joint_damping: wp.array[float],
+    joint_effort_limit: wp.array[float],
     joint_S_s: wp.array[wp.spatial_vector],
     joint_q: wp.array[float],
     joint_qd: wp.array[float],
@@ -431,6 +432,8 @@ def jcalc_tau(
             drive_f = joint_force(
                 q, qd, target_pos, target_vel, target_ke, target_kd, lower, upper, limit_ke, limit_kd, damping
             )
+            eff = joint_effort_limit[j]
+            drive_f = wp.clamp(drive_f, -eff, eff)
 
             # total torque / force on the joint
             t = -wp.dot(S_s, body_f_s) + drive_f + joint_f[j]
@@ -1162,6 +1165,7 @@ def eval_rigid_tau(
     joint_limit_ke: wp.array[float],
     joint_limit_kd: wp.array[float],
     joint_damping: wp.array[float],
+    joint_effort_limit: wp.array[float],
     joint_S_s: wp.array[wp.spatial_vector],
     body_q_com: wp.array[wp.transform],
     body_solve_origin: wp.array[wp.vec3],
@@ -1210,6 +1214,7 @@ def eval_rigid_tau(
             joint_limit_ke,
             joint_limit_kd,
             joint_damping,
+            joint_effort_limit,
             joint_S_s,
             joint_q,
             joint_qd,
