@@ -10,7 +10,10 @@
 - Add opt-in `body_frame_origin="com"` to `ModelBuilder.add_rod()` and `ModelBuilder.add_rod_graph()` for COM-centered cable capsule body frames.
 - Add user-defined pressure laws to hydroelastic SDF contact via `HydroelasticSDF.Config.pressure_func` (a `@wp.func` mapping `(signed_depth, shape_idx, data) -> pressure`) and `pressure_data` (a `@wp.struct` carrying per-shape state). The contact patch is the iso-pressure surface `p_a == p_b`; the default linear law `pressure = -kh * signed_depth` is preserved when no callback is supplied.
 - Add `SensorTiledCamera.utils.assign_checkerboard_material(shape_indices=...)` for applying the checkerboard texture to selected shapes.
+- Add a world origin coordinate frame (RGB axis lines: X red, Y green, Z blue) to `ViewerUSD`; toggle with `show_origin` and size with `origin_axis_length` in the constructor.
 - Add `--render-fps` to cap example rendering rate without changing simulation frame timing
+- Add a `copy` argument to `Model.state()` (`"clone"` (default), `"zeros"`, or `"empty"`) controlling how the configuration arrays are initialized; use `"zeros"`/`"empty"` for intermediate states in differentiable rollouts to avoid redundant copies and prevent gradient leakage across optimization iterations.
+- Add an `integrator` argument to `SolverFeatherstone` (`"euler"` (default, unchanged behavior) or `"implicitfast"`). `"implicitfast"` folds the velocity-linear branches of rigid contact into the generalized inertia (`H_eff = H + dt * sum [ kd Jn^T Jn + kf Jt^T Jt ]`) and solves the symmetric system, integrating them by backward Euler so they are unconditionally stable: (1) the linear viscous branch of contact **friction** (`Jt`), so its tangent no longer destabilizes a backprop-through-time gradient for stiff, many-contact systems; and (2) **normal** contact damping (`Jn`), reinterpreted under `"implicitfast"` as a non-depth-scaled linear dashpot so it can be set near-critical to absorb impacts (a compliant landing instead of the explicit penalty's elastic rebound). The Coulomb-capped friction branch, the normal spring, joint drives, and all other forces remain explicit; `"euler"` keeps the original depth-scaled damping and is byte-identical.
 
 ### Changed
 
@@ -39,6 +42,7 @@
 - Fix `RenderContext` triangle mesh construction by removing the unsupported `device=` keyword from `wp.Mesh(...)`.
 - Fix MJCF `euler` producing wrong orientations for multi-component angles by treating angles as intrinsic rotations. (#3030)
 - Fix `newton.eval_fk` / `newton.eval_ik` producing wrong rotations and joint velocities for `JointType.D6` with three angular DOFs whose axes form a left-handed orthonormal basis.
+- Fix incorrect gradients in multi-step differentiable rollouts with `SolverFeatherstone`; the per-step mass matrix and its Cholesky factorization are now stored per `State` so the backward pass no longer aliases them across timesteps.
 - Fix MJCF parsing so attributes from multiple `<compiler>` elements, including `<include>`-expanded children, are merged in document order. (#3030)
 - Fix MJCF worldbody static geoms bypassing the visual/collider class filter, so `parse_visuals=False` drops visual-class geoms attached directly to `<worldbody>` too. (#3030)
 - Fix `cable_cross_slide_table` example stability so the cable-driven table reliably tracks its rectangular path and catches drift during regression runs.

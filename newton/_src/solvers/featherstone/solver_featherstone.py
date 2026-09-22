@@ -31,6 +31,7 @@ from .kernels import (
     convert_free_distance_joint_qd_public_to_internal,
     copy_kinematic_joint_state,
     correct_free_distance_body_pose_from_world_twist,
+    create_cholesky_kernel,
     create_inertia_matrix_cholesky_kernel,
     create_inertia_matrix_kernel,
     eval_dense_cholesky_batched,
@@ -38,10 +39,13 @@ from .kernels import (
     eval_dense_solve_batched,
     eval_fk_with_velocity_conversion,
     eval_fk_with_velocity_conversion_from_joint_starts,
+    eval_implicit_contact_friction,
+    eval_implicit_joint_limit,
     eval_rigid_fk,
     eval_rigid_id,
     eval_rigid_jacobian,
     eval_rigid_mass,
+    eval_rigid_mass_blockdiag,
     eval_rigid_tau,
     integrate_generalized_joints,
     reconstruct_free_distance_joint_q_from_body_pose,
@@ -136,6 +140,7 @@ class SolverFeatherstone(SolverBase):
         friction_smoothing: float = 1.0,
         use_tile_gemm: bool = False,
         fuse_cholesky: bool = True,
+        integrator: str = "euler",
     ):
         """
         Args:
@@ -145,14 +150,28 @@ class SolverFeatherstone(SolverBase):
             friction_smoothing: The delta value for the Huber norm (see :func:`warp.norm_huber() <warp._src.lang.norm_huber>`) used for the friction velocity normalization. Defaults to 1.0.
             use_tile_gemm: Whether to use operators from Warp's Tile API to solve for joint accelerations. Defaults to False.
             fuse_cholesky: Whether to fuse the Cholesky decomposition into the inertia matrix evaluation kernel when using the Tile API. Only used if `use_tile_gemm` is true. Defaults to True.
+            integrator: Time-integration scheme for the velocity-dependent contact forces. ``"euler"``
+                (default) integrates everything explicitly (the original behavior, unchanged).
+                ``"implicitfast"`` additionally folds the LINEAR VISCOUS branch of rigid contact
+                friction into the generalized inertia (``H_eff = H + dt * J_t.T * kf * J_t``) and solves
+                the resulting symmetric system, making that branch unconditionally stable; the
+                Coulomb-capped friction branch, joint drives, and all other forces stay explicit. Use
+                ``"implicitfast"`` for stiff, many-contact systems whose explicit viscous-friction tangent
+                would otherwise destabilize a backprop-through-time gradient.
         """
         super().__init__(model)
+
+        if integrator not in ("euler", "implicitfast"):
+            raise ValueError(
+                f"Unsupported Featherstone integrator {integrator!r}; expected 'euler' or 'implicitfast'"
+            )
 
         self.angular_damping = angular_damping
         self.update_mass_matrix_interval = update_mass_matrix_interval
         self.friction_smoothing = friction_smoothing
         self.use_tile_gemm = use_tile_gemm
         self.fuse_cholesky = fuse_cholesky
+        self.integrator = integrator
 
         self._step = 0
         self._mass_matrix_dirty = False
@@ -164,18 +183,30 @@ class SolverFeatherstone(SolverBase):
 
         if self.use_tile_gemm:
             # create a custom kernel to evaluate the system matrix for this type
-            if self.fuse_cholesky:
+            if self.fuse_cholesky and self.integrator != "implicitfast":
                 self.eval_inertia_matrix_cholesky_kernel = create_inertia_matrix_cholesky_kernel(
                     int(self.joint_count), int(self.dof_count)
                 )
+                _tile_kernel = self.eval_inertia_matrix_cholesky_kernel
             else:
                 self.eval_inertia_matrix_kernel = create_inertia_matrix_kernel(
                     int(self.joint_count), int(self.dof_count)
                 )
+                _tile_kernel = self.eval_inertia_matrix_kernel
 
-            # ensure matrix is reloaded since otherwise an unload can happen during graph capture
-            # todo: should not be necessary?
-            wp.load_module(device=wp.get_device())
+            # implicitfast factors H_eff with a SEPARATE Cholesky (it can't be fused into the GEMM since the
+            # contact damping is folded in post-GEMM). Use the Tile-API Cholesky (one block/articulation,
+            # cooperative) in place of the scalar one-thread eval_dense_cholesky_batched.
+            self.eval_cholesky_kernel = None
+            if self.integrator == "implicitfast":
+                self.eval_cholesky_kernel = create_cholesky_kernel(int(self.dof_count))
+
+            # Pre-load the freshly-created tile kernel's OWN module on-device, so a lazy module load
+            # cannot happen DURING graph capture (Warp forbids it). The previous bare
+            # `wp.load_module(device=...)` defaulted to the CALLER's module (solver_featherstone), which
+            # defines no Warp kernels -> RuntimeError; the dynamically-created tile kernel lives in the
+            # featherstone.kernels module.
+            wp.load_module(_tile_kernel.module, device=wp.get_device())
 
     def _update_kinematic_state(self):
         """Recompute cached solver flags and effective joint armature."""
@@ -273,10 +304,14 @@ class SolverFeatherstone(SolverBase):
             articulation_dof_start = []
             articulation_coord_start = []
 
+            body_articulation = np.full(model.body_count, -1, dtype=np.int32)
+            body_jacobian_row = np.full(model.body_count, -1, dtype=np.int32)
+
             articulation_start = model.articulation_start.numpy()
             articulation_end = model.articulation_end.numpy()
             joint_q_start = model.joint_q_start.numpy()
             joint_qd_start = model.joint_qd_start.numpy()
+            joint_child = model.joint_child.numpy()
 
             for i in range(model.articulation_count):
                 first_joint = articulation_start[i]
@@ -296,6 +331,11 @@ class SolverFeatherstone(SolverBase):
                 articulation_dof_start.append(first_dof)
                 articulation_coord_start.append(first_coord)
 
+                for row, joint_idx in enumerate(range(first_joint, last_joint)):
+                    child = int(joint_child[joint_idx])
+                    body_articulation[child] = i
+                    body_jacobian_row[child] = row
+
                 # bit of data duplication here, but will leave it as such for clarity
                 articulation_M_rows.append(joint_count * 6)
                 articulation_H_rows.append(dof_count)
@@ -309,7 +349,12 @@ class SolverFeatherstone(SolverBase):
                     self.dof_count = dof_count
 
                 self.J_size += 6 * joint_count * dof_count
-                self.M_size += 6 * joint_count * 6 * joint_count
+                if self.use_tile_gemm:
+                    # COMPACT block-diagonal M: joint_count 6x6 inertia blocks (the tile GEMM only reads
+                    # the diagonal blocks). 30x smaller than the dense (6*joint_count)^2 mass matrix.
+                    self.M_size += joint_count * 36
+                else:
+                    self.M_size += 6 * joint_count * 6 * joint_count
                 self.H_size += dof_count * dof_count
 
             # matrix offsets for batched gemm
@@ -324,6 +369,8 @@ class SolverFeatherstone(SolverBase):
 
             self.articulation_dof_start = wp.array(articulation_dof_start, dtype=wp.int32, device=model.device)
             self.articulation_coord_start = wp.array(articulation_coord_start, dtype=wp.int32, device=model.device)
+            self.body_articulation = wp.array(body_articulation, dtype=wp.int32, device=model.device)
+            self.body_jacobian_row = wp.array(body_jacobian_row, dtype=wp.int32, device=model.device)
 
     def _allocate_model_aux_vars(self, model):
         # allocate auxiliary variables pertaining to the model (constant across states)
@@ -358,7 +405,12 @@ class SolverFeatherstone(SolverBase):
             target.M = wp.zeros((self.M_size,), dtype=wp.float32, device=model.device, requires_grad=requires_grad)
             target.J = wp.zeros((self.J_size,), dtype=wp.float32, device=model.device, requires_grad=requires_grad)
             target.P = wp.empty_like(target.J, requires_grad=requires_grad)
+            # Cached physical generalized inertia (H_base = J^T M J).  When integrator="implicitfast"
+            # the per-step effective matrix H_eff = H + dt*D (D = contact viscous-friction damping) is
+            # kept separate so the slowly-varying cached base never accumulates the fast-varying damping.
             target.H = wp.empty((self.H_size,), dtype=wp.float32, device=model.device, requires_grad=requires_grad)
+            if self.integrator == "implicitfast":
+                target.H_eff = wp.empty_like(target.H, requires_grad=requires_grad)
 
             # zero since only upper triangle is set which can trigger NaN detection
             target.L = wp.zeros_like(target.H)
@@ -645,6 +697,10 @@ class SolverFeatherstone(SolverBase):
                             contacts.rigid_contact_friction,
                             False,
                             self.friction_smoothing,
+                            # euler: depth-scaled normal damping (byte-identical to original / dflex match).
+                            # implicitfast: NON-depth-scaled linear dashpot (kd), folded implicitly by
+                            # eval_implicit_contact so kd can be ~critical and absorb impacts.
+                            self.integrator != "implicitfast",
                         ],
                         outputs=[body_f],
                         device=model.device,
@@ -735,8 +791,13 @@ class SolverFeatherstone(SolverBase):
                     # print("body_qd:")
                     # print(state_in.body_qd.numpy())
 
-                    if self._mass_matrix_dirty or self._step % self.update_mass_matrix_interval == 0:
-                        # build J
+                    update_mass_matrix = self._mass_matrix_dirty or self._step % self.update_mass_matrix_interval == 0
+                    implicit = self.integrator == "implicitfast"
+
+                    # implicitfast: the contact viscous-friction damping D changes every substep, so its
+                    # kinematic Jacobian J must be refreshed every substep even when the physical mass
+                    # matrix H_base is cached. (euler refreshes J only on a mass-matrix rebuild.)
+                    if update_mass_matrix or implicit:
                         wp.launch(
                             eval_rigid_jacobian,
                             dim=model.articulation_count,
@@ -752,9 +813,10 @@ class SolverFeatherstone(SolverBase):
                             device=model.device,
                         )
 
-                        # build M
+                    if update_mass_matrix:
+                        # build M (compact block-diagonal for the tile path, dense otherwise)
                         wp.launch(
-                            eval_rigid_mass,
+                            eval_rigid_mass_blockdiag if self.use_tile_gemm else eval_rigid_mass,
                             dim=model.articulation_count,
                             inputs=[
                                 model.articulation_start,
@@ -767,17 +829,18 @@ class SolverFeatherstone(SolverBase):
                         )
 
                         if self.use_tile_gemm:
-                            # reshape arrays
-                            M_tiled = state_aug.M.reshape((-1, 6 * self.joint_count, 6 * self.joint_count))
+                            # reshape arrays. M is compact block-diagonal: (num_joints*6, 6) per articulation,
+                            # body i's 6x6 inertia at rows [i*6:i*6+6] (the GEMM loads it at offset (i*6, 0)).
+                            M_tiled = state_aug.M.reshape((-1, 6 * self.joint_count, 6))
                             J_tiled = state_aug.J.reshape((-1, 6 * self.joint_count, self.dof_count))
                             R_tiled = self.joint_armature_effective.reshape((-1, self.dof_count))
                             H_tiled = state_aug.H.reshape((-1, self.dof_count, self.dof_count))
                             L_tiled = state_aug.L.reshape((-1, self.dof_count, self.dof_count))
-                            assert H_tiled.shape == (model.articulation_count, 18, 18)
-                            assert L_tiled.shape == (model.articulation_count, 18, 18)
-                            assert R_tiled.shape == (model.articulation_count, 18)
+                            assert H_tiled.shape == (model.articulation_count, self.dof_count, self.dof_count)
+                            assert L_tiled.shape == (model.articulation_count, self.dof_count, self.dof_count)
+                            assert R_tiled.shape == (model.articulation_count, self.dof_count)
 
-                            if self.fuse_cholesky:
+                            if self.fuse_cholesky and not implicit:
                                 wp.launch_tiled(
                                     self.eval_inertia_matrix_cholesky_kernel,
                                     dim=model.articulation_count,
@@ -797,19 +860,20 @@ class SolverFeatherstone(SolverBase):
                                     block_dim=256,
                                 )
 
-                                wp.launch(
-                                    eval_dense_cholesky_batched,
-                                    dim=model.articulation_count,
-                                    inputs=[
-                                        self.articulation_H_start,
-                                        self.articulation_H_rows,
-                                        self.articulation_dof_start,
-                                        state_aug.H,
-                                        self.joint_armature_effective,
-                                    ],
-                                    outputs=[state_aug.L],
-                                    device=model.device,
-                                )
+                                if not implicit:
+                                    wp.launch(
+                                        eval_dense_cholesky_batched,
+                                        dim=model.articulation_count,
+                                        inputs=[
+                                            self.articulation_H_start,
+                                            self.articulation_H_rows,
+                                            self.articulation_dof_start,
+                                            state_aug.H,
+                                            self.joint_armature_effective,
+                                        ],
+                                        outputs=[state_aug.L],
+                                        device=model.device,
+                                    )
 
                             # import numpy as np
                             # J = J_tiled.numpy()
@@ -866,20 +930,22 @@ class SolverFeatherstone(SolverBase):
                                 device=model.device,
                             )
 
-                            # compute decomposition
-                            wp.launch(
-                                eval_dense_cholesky_batched,
-                                dim=model.articulation_count,
-                                inputs=[
-                                    self.articulation_H_start,
-                                    self.articulation_H_rows,
-                                    self.articulation_dof_start,
-                                    state_aug.H,
-                                    self.joint_armature_effective,
-                                ],
-                                outputs=[state_aug.L],
-                                device=model.device,
-                            )
+                            # The implicit path augments and factors a fresh
+                            # effective matrix below on every substep.
+                            if not implicit:
+                                wp.launch(
+                                    eval_dense_cholesky_batched,
+                                    dim=model.articulation_count,
+                                    inputs=[
+                                        self.articulation_H_start,
+                                        self.articulation_H_rows,
+                                        self.articulation_dof_start,
+                                        state_aug.H,
+                                        self.joint_armature_effective,
+                                    ],
+                                    outputs=[state_aug.L],
+                                    device=model.device,
+                                )
 
                         # print("joint_target:")
                         # print(control.joint_target.numpy())
@@ -891,11 +957,129 @@ class SolverFeatherstone(SolverBase):
                         # print(state_aug.L.numpy())
                         self._mass_matrix_dirty = False
                     elif state_aug is not self:
-                        # per-state buffers (autodiff): the mass matrix is not rebuilt this
-                        # step, so carry the previous step's factorization forward into this
-                        # state's buffers (the forward solve and its adjoint read state_aug.L)
+                        # Per-state buffers (autodiff): carry the cached physical
+                        # inertia forward.  The implicit factorization cannot be
+                        # carried because its contact contribution changes each step.
                         wp.copy(state_aug.H, state_in.H)
-                        wp.copy(state_aug.L, state_in.L)
+                        if not implicit:
+                            wp.copy(state_aug.L, state_in.L)
+
+                    solve_matrix = state_aug.H
+                    if implicit:
+                        # implicitfast: fold the linear viscous contact-friction damping D into the
+                        # inertia and factor/solve the symmetric H_eff = H_base + dt*D. H_eff is a
+                        # per-State buffer = copy of the cached base H (out-of-place: H_base never
+                        # accumulates D), with D added in place by the friction kernel below. The exact
+                        # gradient is taken: the solve's adjoint[H_eff] reaches H_base (-> gemm -> J/M,
+                        # as in euler) AND flows through the friction accumulation into J / the contact
+                        # points (dH_eff/dq); the velocity->velocity contraction comes from H_eff's value
+                        # in the solve plus the explicit friction in joint_tau.
+                        wp.copy(state_aug.H_eff, state_aug.H)
+                        if contacts is not None and contacts.rigid_contact_max:
+                            wp.launch(
+                                eval_implicit_contact_friction,
+                                dim=contacts.rigid_contact_max,
+                                inputs=[
+                                    state_in.body_q,
+                                    state_aug.body_qd_fk,
+                                    model.body_com,
+                                    model.body_flags,
+                                    model.shape_material_ke,
+                                    model.shape_material_kd,
+                                    model.shape_material_kf,
+                                    model.shape_material_ka,
+                                    model.shape_material_mu,
+                                    model.shape_body,
+                                    self.body_articulation,
+                                    self.body_jacobian_row,
+                                    self.articulation_J_start,
+                                    self.articulation_H_start,
+                                    self.articulation_H_rows,
+                                    state_aug.body_solve_origin,
+                                    state_aug.J,
+                                    contacts.rigid_contact_count,
+                                    contacts.rigid_contact_point0,
+                                    contacts.rigid_contact_point1,
+                                    contacts.rigid_contact_normal,
+                                    contacts.rigid_contact_shape0,
+                                    contacts.rigid_contact_shape1,
+                                    contacts.rigid_contact_margin0,
+                                    contacts.rigid_contact_margin1,
+                                    contacts.rigid_contact_stiffness,
+                                    contacts.rigid_contact_damping,
+                                    contacts.rigid_contact_friction,
+                                    self.friction_smoothing,
+                                    dt,
+                                ],
+                                outputs=[state_aug.H_eff],
+                                device=model.device,
+                            )
+                        # Fold the active, unsaturated hard joint-limit spring/damper into H_eff (and the
+                        # spring-velocity coupling into joint_tau) by backward Euler -- the joint-space
+                        # analogue of the contact-friction fold above. Without it the explicit stiff
+                        # limit_ke penalty is an expansive BPTT mode (a foot/ankle driven past its limit
+                        # blows the adjoint up); folding makes the per-substep velocity contraction stable.
+                        # implicitfast only; euler never reaches this branch -> trajectory byte-identical.
+                        wp.launch(
+                            eval_implicit_joint_limit,
+                            dim=model.articulation_count,
+                            inputs=[
+                                model.articulation_start,
+                                model.articulation_end,
+                                self.articulation_dof_start,
+                                self.articulation_H_start,
+                                self.articulation_H_rows,
+                                model.joint_type,
+                                model.joint_q_start,
+                                model.joint_qd_start,
+                                model.joint_target_q_start,
+                                model.joint_dof_dim,
+                                state_in.joint_q,
+                                state_aug.joint_qd_internal_in,
+                                control.joint_target_q,
+                                control.joint_target_qd,
+                                model.joint_target_ke,
+                                model.joint_target_kd,
+                                model.joint_limit_lower,
+                                model.joint_limit_upper,
+                                model.joint_limit_ke,
+                                model.joint_limit_kd,
+                                model.joint_damping,
+                                model.joint_effort_limit,
+                                dt,
+                            ],
+                            outputs=[state_aug.H_eff, state_aug.joint_tau],
+                            device=model.device,
+                        )
+                        if self.use_tile_gemm:
+                            # Tile-API Cholesky (one block/articulation) of H_eff + diag(armature) -> L.
+                            n = int(self.dof_count)
+                            wp.launch_tiled(
+                                self.eval_cholesky_kernel,
+                                dim=model.articulation_count,
+                                inputs=[
+                                    state_aug.H_eff.reshape((-1, n, n)),
+                                    self.joint_armature_effective.reshape((-1, n)),
+                                ],
+                                outputs=[state_aug.L.reshape((-1, n, n))],
+                                device=model.device,
+                                block_dim=64,
+                            )
+                        else:
+                            wp.launch(
+                                eval_dense_cholesky_batched,
+                                dim=model.articulation_count,
+                                inputs=[
+                                    self.articulation_H_start,
+                                    self.articulation_H_rows,
+                                    self.articulation_dof_start,
+                                    state_aug.H_eff,
+                                    self.joint_armature_effective,
+                                ],
+                                outputs=[state_aug.L],
+                                device=model.device,
+                            )
+                        solve_matrix = state_aug.H_eff
 
                     # solve for qdd
                     state_aug.joint_qdd.zero_()
@@ -906,7 +1090,7 @@ class SolverFeatherstone(SolverBase):
                             self.articulation_H_start,
                             self.articulation_H_rows,
                             self.articulation_dof_start,
-                            state_aug.H,
+                            solve_matrix,
                             state_aug.L,
                             state_aug.joint_tau,
                         ],

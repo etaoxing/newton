@@ -81,6 +81,8 @@ class ViewerUSD(ViewerBase):
         up_axis: str = "Z",
         num_frames: int | None = 100,
         scaling: float = 1.0,
+        show_origin: bool = True,
+        origin_axis_length: float = 1.0,
     ):
         """
         Initialize the USD viewer backend for Newton physics simulations.
@@ -91,6 +93,9 @@ class ViewerUSD(ViewerBase):
             up_axis: USD up axis, either 'Y' or 'Z'. Default is 'Z'.
             num_frames: Maximum number of frames to record. Default is 100. If None, recording is unlimited.
             scaling: Uniform scaling applied to the scene root. Default is 1.0.
+            show_origin: Whether to draw the world origin coordinate frame as RGB
+                axis lines (X red, Y green, Z blue). Default is True.
+            origin_axis_length: Length [m] of each origin axis line. Default is 1.0.
 
         Raises:
             ImportError: If the usd-core package is not installed.
@@ -105,6 +110,8 @@ class ViewerUSD(ViewerBase):
         self.up_axis = up_axis
         self.scaling = scaling
         self.num_frames = num_frames
+        self.show_origin = show_origin
+        self.origin_axis_length = origin_axis_length
 
         # Create USD stage. If this output path is already registered in the
         # current process, reuse and clear the existing layer instead of
@@ -141,6 +148,8 @@ class ViewerUSD(ViewerBase):
         self._frame_index = 0
         self._frame_count = 0
 
+        self._create_origin_frame()
+
         self.set_model(None)
 
     @override
@@ -171,6 +180,52 @@ class ViewerUSD(ViewerBase):
         self.stage.SetDefaultPrim(self.root.GetPrim())
         self._frame_index = 0
         self._frame_count = 0
+        self._create_origin_frame()
+
+    def _create_origin_frame(self):
+        """Draw the world origin coordinate frame as RGB axis lines.
+
+        Three static line segments emanate from ``(0, 0, 0)``, conveying both
+        position (the shared start point) and orientation (the world X/Y/Z
+        directions): X is red, Y is green, Z is blue. Created once at the scene
+        root (independent of layers and time samples) and re-created whenever the
+        stage is rebuilt.
+        """
+        if not self.show_origin:
+            return
+
+        length = float(self.origin_axis_length)
+        curves = UsdGeom.BasisCurves.Define(self.stage, self.root.GetPath().AppendChild("origin"))
+        curves.CreateTypeAttr().Set(UsdGeom.Tokens.linear)
+        curves.CreatePointsAttr().Set(
+            Vt.Vec3fArray(
+                [
+                    Gf.Vec3f(0.0, 0.0, 0.0),
+                    Gf.Vec3f(length, 0.0, 0.0),  # +X
+                    Gf.Vec3f(0.0, 0.0, 0.0),
+                    Gf.Vec3f(0.0, length, 0.0),  # +Y
+                    Gf.Vec3f(0.0, 0.0, 0.0),
+                    Gf.Vec3f(0.0, 0.0, length),  # +Z
+                ]
+            )
+        )
+        curves.CreateCurveVertexCountsAttr().Set(Vt.IntArray([2, 2, 2]))
+
+        width = length * 0.02
+        curves.CreateWidthsAttr().Set(Vt.FloatArray([width] * 6))
+        curves.SetWidthsInterpolation(UsdGeom.Tokens.vertex)
+
+        # one color per curve (uniform interpolation): red, green, blue
+        color = curves.CreateDisplayColorPrimvar(UsdGeom.Tokens.uniform)
+        color.Set(
+            Vt.Vec3fArray(
+                [
+                    Gf.Vec3f(1.0, 0.0, 0.0),
+                    Gf.Vec3f(0.0, 1.0, 0.0),
+                    Gf.Vec3f(0.0, 0.0, 1.0),
+                ]
+            )
+        )
 
     def _remove_active_layer_prims(self):
         names = set(self._meshes) | set(self._instance_groups) | set(self._instancers) | set(self._points)

@@ -201,6 +201,37 @@ class TestViewerUSD(unittest.TestCase):
 
         self.assertEqual(visibility, "invisible")
 
+    def test_origin_frame_drawn_with_rgb_axes_by_default(self):
+        viewer = self._make_viewer()
+
+        curves = UsdGeom.BasisCurves(viewer.stage.GetPrimAtPath("/root/origin"))
+        self.assertTrue(curves.GetPrim().IsValid())
+        self.assertEqual(list(curves.GetCurveVertexCountsAttr().Get()), [2, 2, 2])
+
+        points = [tuple(p) for p in curves.GetPointsAttr().Get()]
+        length = viewer.origin_axis_length
+        self.assertEqual(
+            points,
+            [
+                (0.0, 0.0, 0.0), (length, 0.0, 0.0),
+                (0.0, 0.0, 0.0), (0.0, length, 0.0),
+                (0.0, 0.0, 0.0), (0.0, 0.0, length),
+            ],
+        )  # fmt: skip
+
+        colors = [tuple(c) for c in curves.GetDisplayColorPrimvar().Get()]
+        self.assertEqual(colors, [(1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)])
+
+    def test_show_origin_false_omits_frame(self):
+        temp_file = tempfile.NamedTemporaryFile(suffix=".usda", delete=False)
+        temp_file.close()
+        self.addCleanup(lambda: os.path.exists(temp_file.name) and os.remove(temp_file.name))
+        viewer = ViewerUSD(output_path=temp_file.name, num_frames=1, show_origin=False)
+        self.addCleanup(viewer.close)
+        self.addCleanup(lambda: setattr(viewer, "output_path", ""))
+
+        self.assertFalse(viewer.stage.GetPrimAtPath("/root/origin").IsValid())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

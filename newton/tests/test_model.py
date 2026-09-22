@@ -2426,5 +2426,55 @@ class TestModelValidation(unittest.TestCase):
             self.fail(f"control.clear() raised {type(e).__name__}: {e}")
 
 
+class TestModelStateCopy(unittest.TestCase):
+    """Tests for the ``copy`` argument of :meth:`Model.state`."""
+
+    def _build(self):
+        builder = ModelBuilder()
+        b = builder.add_body()
+        builder.add_shape_sphere(b)
+        builder.add_particle((0.1, 0.2, 0.3), (0.0, 0.0, 0.0), 1.0)
+        builder.joint_q = [1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 1.0]
+        return builder.finalize(requires_grad=True)
+
+    def test_clone_copies_initial_configuration(self):
+        model = self._build()
+        s = model.state(copy="clone")
+        assert_np_equal(s.joint_q.numpy(), model.joint_q.numpy())
+        assert_np_equal(s.body_q.numpy(), model.body_q.numpy())
+        # force buffers are always zeroed regardless of copy mode
+        assert_np_equal(s.body_f.numpy(), np.zeros_like(s.body_f.numpy()))
+        assert_np_equal(s.particle_f.numpy(), np.zeros_like(s.particle_f.numpy()))
+
+    def test_zeros_zero_initializes_configuration(self):
+        model = self._build()
+        s = model.state(copy="zeros")
+        assert_np_equal(s.joint_q.numpy(), np.zeros_like(s.joint_q.numpy()))
+        assert_np_equal(s.particle_q.numpy(), np.zeros_like(s.particle_q.numpy()))
+        assert_np_equal(s.body_f.numpy(), np.zeros_like(s.body_f.numpy()))
+
+    def test_zeros_does_not_leak_source_grad(self):
+        # wp.clone copies the source .grad; "zeros"/"empty" must not.
+        model = self._build()
+        model.joint_q.grad.assign(np.full(model.joint_q.shape, 5.0, dtype=np.float32))
+
+        s_clone = model.state(copy="clone")
+        self.assertTrue(np.any(s_clone.joint_q.grad.numpy() != 0.0), "clone is expected to copy source grad")
+
+        s_zeros = model.state(copy="zeros")
+        assert_np_equal(s_zeros.joint_q.grad.numpy(), np.zeros_like(s_zeros.joint_q.grad.numpy()))
+
+    def test_empty_allocates_without_error(self):
+        model = self._build()
+        s = model.state(copy="empty")
+        self.assertEqual(s.joint_q.shape, model.joint_q.shape)
+        self.assertEqual(s.body_q.shape, model.body_q.shape)
+
+    def test_invalid_copy_mode_raises(self):
+        model = self._build()
+        with self.assertRaises(ValueError):
+            model.state(copy="bogus")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

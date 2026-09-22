@@ -1,11 +1,21 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
+import os
+
 import warp as wp
 
 from ...geometry import ParticleFlags
 from ...geometry.kernels import triangle_closest_point_barycentric
 from ...sim import Contacts, Model, State
+
+# A/B flag (2026-07-15, G1 shuffle-gait investigation): NEWTON_FRICTION_CAP_TOTAL=1 includes the
+# normal DASHPOT share fd in the rigid-contact Coulomb cap, restoring dflex's -mu*(fn+fd) (the cap on
+# the TOTAL normal force) that commit 40b61ca0 reduced to the elastic-only -mu*fn. Elastic-only starves
+# the cap exactly at touchdown when a near-critical kd absorbs the impact (fn ~ 0 while the dashpot
+# carries the load), so feet slide on every strike. Default 0 = elastic-only (current behavior,
+# bit-identical). Read at import; mirrored by featherstone/kernels.py for the implicit fold predicate.
+FRICTION_CAP_TOTAL = wp.constant(int(os.environ.get("NEWTON_FRICTION_CAP_TOTAL", "0")))
 
 
 @wp.func
@@ -378,8 +388,32 @@ def eval_triangles_body_contact(
     wp.atomic_add(tri_f, k, f_total * bary[2])
 
 
-@wp.kernel
-def eval_body_contact(
+@wp.struct
+class ContactKinematics:
+    """Resolved rigid-contact geometry/materials shared by the explicit and implicit paths."""
+
+    active: wp.bool  # True iff the contact produces a force (passed the eval_body_contact early-outs)
+    body_a: wp.int32
+    body_b: wp.int32
+    n: wp.vec3  # contact normal, B-to-A convention (= -contact_normal)
+    bx_a: wp.vec3  # world contact point on A (margin shifted)
+    bx_b: wp.vec3  # world contact point on B (margin shifted)
+    r_a: wp.vec3  # bx_a - world COM of A
+    r_b: wp.vec3  # bx_b - world COM of B
+    d: wp.float32  # signed gap (penetration < 0)
+    vn: wp.float32  # normal relative speed
+    vt: wp.vec3  # tangential relative velocity
+    fn: wp.float32  # elastic normal force d*ke (< 0 in penetration)
+    ke: wp.float32
+    kd: wp.float32
+    kf: wp.float32
+    ka: wp.float32
+    mu: wp.float32
+
+
+@wp.func
+def eval_contact_kinematics(
+    tid: int,
     body_q: wp.array[wp.transform],
     body_qd: wp.array[wp.spatial_vector],
     body_com: wp.array[wp.vec3],
@@ -389,7 +423,6 @@ def eval_body_contact(
     shape_material_ka: wp.array[float],
     shape_material_mu: wp.array[float],
     shape_body: wp.array[int],
-    contact_count: wp.array[int],
     contact_point0: wp.array[wp.vec3],
     contact_point1: wp.array[wp.vec3],
     contact_normal: wp.array[wp.vec3],
@@ -401,16 +434,23 @@ def eval_body_contact(
     rigid_contact_damping: wp.array[float],
     rigid_contact_friction_scale: wp.array[float],
     force_in_world_frame: bool,
-    friction_smoothing: float,
-    # outputs
-    body_f: wp.array[wp.spatial_vector],
 ):
-    tid = wp.tid()
+    """SINGLE SOURCE OF TRUTH for rigid-contact geometry, material resolution, and the kinematic
+    decomposition (penetration, relative point velocity).
 
-    count = contact_count[0]
-    if tid >= count:
-        return
+    Used by BOTH the explicit spring-damper force in :func:`eval_body_contact` and the implicit
+    viscous-friction inertia augmentation in ``featherstone.eval_implicit_contact_friction`` so the
+    force and its linearization (``D = kf * J_t^T J_t``) can never diverge. ``ContactKinematics.active``
+    reproduces the two early-outs ``eval_body_contact`` takes: a degenerate self shape-pair, or a
+    separation ``d >= ka``. (The ``tid >= contact_count`` bound is left to each kernel.)
 
+    GRADIENT: the result struct must be built with the single full CONSTRUCTOR call at the end -- never
+    by assigning fields one at a time. Warp 1.14 silently DROPS the reverse-mode adjoint through struct
+    field assignments (``ck.d = d`` -> d(loss)/d(anything upstream) = 0, even inside a kernel body),
+    which severed the entire contact-force backward (d(force)/d(body_q, body_qd) == 0, killing the
+    velocity feedback of every contact in BPTT). The constructor form differentiates correctly.
+    Minimal repro: ../rewarped/_scratch/warp_struct_grad_repro.py.
+    """
     # retrieve contact margins, compute average contact material properties
     ke = 0.0  # contact normal force stiffness
     kd = 0.0  # damping coefficient
@@ -423,7 +463,7 @@ def eval_body_contact(
     shape_a = contact_shape0[tid]
     shape_b = contact_shape1[tid]
     if shape_a == shape_b:
-        return
+        return ContactKinematics()
     body_a = -1
     body_b = -1
     if shape_a >= 0:
@@ -480,7 +520,7 @@ def eval_body_contact(
     d = wp.dot(n, bx_a - bx_b)
 
     if d >= ka:
-        return
+        return ContactKinematics()
 
     # compute contact point velocity
     bv_a = wp.vec3(0.0)
@@ -506,8 +546,6 @@ def eval_body_contact(
     # relative velocity
     v = bv_a - bv_b
 
-    # print(v)
-
     # decompose relative velocity
     vn = wp.dot(n, v)
     vt = v - n * vn
@@ -515,8 +553,119 @@ def eval_body_contact(
     # contact elastic
     fn = d * ke
 
+    # Single constructor call (NOT field assignments) -- see the GRADIENT note in the docstring.
+    return ContactKinematics(
+        wp.bool(True),  # active
+        body_a,
+        body_b,
+        n,
+        bx_a,
+        bx_b,
+        r_a,
+        r_b,
+        d,
+        vn,
+        vt,
+        fn,
+        ke,
+        kd,
+        kf,
+        ka,
+        mu,
+    )
+
+
+@wp.kernel
+def eval_body_contact(
+    body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+    body_com: wp.array[wp.vec3],
+    shape_material_ke: wp.array[float],
+    shape_material_kd: wp.array[float],
+    shape_material_kf: wp.array[float],
+    shape_material_ka: wp.array[float],
+    shape_material_mu: wp.array[float],
+    shape_body: wp.array[int],
+    contact_count: wp.array[int],
+    contact_point0: wp.array[wp.vec3],
+    contact_point1: wp.array[wp.vec3],
+    contact_normal: wp.array[wp.vec3],
+    contact_shape0: wp.array[int],
+    contact_shape1: wp.array[int],
+    contact_margin0: wp.array[float],
+    contact_margin1: wp.array[float],
+    rigid_contact_stiffness: wp.array[float],
+    rigid_contact_damping: wp.array[float],
+    rigid_contact_friction_scale: wp.array[float],
+    force_in_world_frame: bool,
+    friction_smoothing: float,
+    depth_scaled_damping: bool,
+    # outputs
+    body_f: wp.array[wp.spatial_vector],
+):
+    tid = wp.tid()
+
+    count = contact_count[0]
+    if tid >= count:
+        return
+
+    ck = eval_contact_kinematics(
+        tid,
+        body_q,
+        body_qd,
+        body_com,
+        shape_material_ke,
+        shape_material_kd,
+        shape_material_kf,
+        shape_material_ka,
+        shape_material_mu,
+        shape_body,
+        contact_point0,
+        contact_point1,
+        contact_normal,
+        contact_shape0,
+        contact_shape1,
+        contact_margin0,
+        contact_margin1,
+        rigid_contact_stiffness,
+        rigid_contact_damping,
+        rigid_contact_friction_scale,
+        force_in_world_frame,
+    )
+    if not ck.active:
+        return
+
+    body_a = ck.body_a
+    body_b = ck.body_b
+    n = ck.n
+    bx_a = ck.bx_a
+    bx_b = ck.bx_b
+    r_a = ck.r_a
+    r_b = ck.r_b
+    d = ck.d
+    vn = ck.vn
+    vt = ck.vt
+    kd = ck.kd
+    kf = ck.kf
+    mu = ck.mu
+    fn = ck.fn
+
     # contact damping
-    fd = wp.min(vn, 0.0) * kd * wp.step(d) * (-d)
+    # depth_scaled_damping (default for euler / semi-implicit): match dflex's articulated contact
+    # (eval_rigid_contacts_art): fd = min(vn,0) * kd * step(c) * (-c), where -c (= -d here) is the
+    # penetration depth -- dflex's literal kd then transfers directly. This is BYTE-IDENTICAL to the
+    # original behavior when depth_scaled_damping is True.
+    #
+    # depth_scaled_damping=False (SolverFeatherstone integrator="implicitfast"): kd is a NON-depth-scaled
+    # linear normal dashpot, fd = min(vn,0) * kd * step(d), which (unlike the depth-scaled form, ~0 at the
+    # shallow penetration of an incoming impact) damps from first contact. Folded implicitly into the
+    # inertia by featherstone.eval_implicit_contact (backward Euler), so kd can be raised to ~critical to
+    # ABSORB impacts without explicit instability -- a compliant, MuJoCo-solref-like landing instead of
+    # the elastic penalty rebound. Set high enough, this stops the open-loop foot slip/topple.
+    if depth_scaled_damping:
+        fd = wp.min(vn, 0.0) * kd * wp.step(d) * (-d)
+    else:
+        fd = wp.min(vn, 0.0) * kd * wp.step(d)
 
     # viscous friction
     # ft = vt*kf
@@ -530,11 +679,50 @@ def eval_body_contact(
 
     # ft = wp.vec3(vx, 0.0, vz)
 
+    # Coulomb friction. Match dflex's eval_rigid_contacts_art EXACTLY:
+    #     ft = normalize(vt) * min(kf*|vt|, mu*|fn|)
+    # i.e. a TRUE-unit direction times a magnitude that ramps viscously (kf*|vt|) up to the Coulomb
+    # cap mu*|fn| (elastic normal force only -- including the damping fd over-grips on foot-strike).
+    #
+    # The previous code substituted the Huber norm vs=norm_huber(vt,delta) for |vt| in BOTH the
+    # direction (fr=vt/vs) and the magnitude (kf*vs). Because vs != |vt|, the direction was non-unit
+    # (|fr| = |vt|/vs) and, in the cap regime, |ft| = (|vt|/vs)*mu*|fn| with |vt|/vs in [1,2] -- a
+    # velocity-dependent OVER-grip peaking at 2x the cap exactly at |vt|=delta(=friction_smoothing=1),
+    # plus a low-slip viscous band ~sqrt(2)x...6x wider than dflex's (it reaches the cap only at
+    # |vt|=sqrt(2 mu|fn|/kf), vs dflex's mu|fn|/kf). Net effect: the foot grips WEAKEST exactly when
+    # planted (low slip) and STRONGEST when shuffling at ~1 m/s, which pushes the policy toward a
+    # sliding, splayed-down gait instead of dflex's planted, tall ~90deg stance.
+    #
+    # The true-norm form is gradient-stable per-step: in the viscous regime |vt| inside min() cancels
+    # the 1/|vt| in normalize (ft = kf*vt, linear); in the cap regime |vt| > mu|fn|/kf is bounded off 0.
+    #
+    # RESOLVED (2026-07-18): the "friction backward bias" below was the warp-1.14 struct-assign severed
+    # adjoint (see eval_contact_kinematics GRADIENT note); post-fix re-measurement: grounded Ant H=32
+    # rewarped-vs-dflex cos = 0.9999 (|g| ratio 0.99), and directional FD self-check ratios ~1.0 with
+    # NEWTON_FRICTION_CAP_TOTAL both 0 and 1 (_scratch/probe_captotal_fd.py). Kept for history:
+    # KNOWN OPEN ISSUE (2026-06-27) -- friction BACKWARD bias at depth. With friction ON, warp's ANALYTIC
+    # multi-step gradient through this contact is ANTI-CORRELATED with FD in the standing/on-policy regime
+    # (cos(analytic,FD) ~= -0.19 at H=32 standing, -0.35 gentle, +0.59 falling), while MU=0 gives +0.98
+    # in every regime and dflex is EXACT (+1.0) everywhere. It is NOT the vt/s division: a branch-split
+    # `kf*vt` (viscous) vs `(vt/s)*cap` (sliding) reformulation gave a BYTE-IDENTICAL backward, i.e. the
+    # per-step friction Jacobian d(ft)/d(vt)=kf is already correct. The bias is in how the
+    # velocity-dependent friction body_f propagates through the FEATHERSTONE backward accumulated over
+    # many steps (free-space H=64 backward is exact, normal+damping backward is exact -> specific to the
+    # velocity-dependent contact wrench). Repro/knobs: _scratch/bench_grad.py (MU, ASCALE, fd mode),
+    # _scratch/test_dflex_fd.py. This is the real remaining gap behind the rewarped-vs-dflex grounded
+    # gradient (cos ~0.5) and the first-order-RL training plateau; the forward (huber + margin fixes) now
+    # matches dflex to ~1e-4.
     ft = wp.vec3(0.0)
     if d < 0.0:
         s = wp.length(vt)
         if s > 1.0e-6 * friction_smoothing:
-            ft = (vt / s) * wp.min(kf * s, -mu * fn)
+            # NEWTON_FRICTION_CAP_TOTAL=1: cap on the TOTAL normal force (fn + fd), dflex's original
+            # -mu*(fn+fd) -- both terms are <= 0 in penetration, so the cap only grows. Restores
+            # touchdown grip when the dashpot carries the impact load (fn ~ 0 at strike).
+            cap = -mu * fn
+            if FRICTION_CAP_TOTAL != 0:
+                cap = -mu * (fn + fd)
+            ft = (vt / s) * wp.min(kf * s, cap)
 
     f_total = n * (fn + fd) + ft
     # f_total = n * (fn + fd)
@@ -638,6 +826,7 @@ def eval_body_contact_forces(
                 contacts.rigid_contact_friction,
                 force_in_world_frame,
                 friction_smoothing,
+                True,  # depth_scaled_damping: semi-implicit keeps the dflex-matched depth-scaled normal damping
             ],
             outputs=[body_f_out],
             device=model.device,

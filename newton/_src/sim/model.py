@@ -9,7 +9,7 @@ import logging
 import warnings
 from collections.abc import Callable
 from enum import IntEnum
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 import warp as wp
@@ -1569,19 +1569,43 @@ class Model:
         )
         self.bvh_particles.refit()
 
-    def state(self, requires_grad: bool | None = None) -> State:
+    def state(
+        self,
+        requires_grad: bool | None = None,
+        copy: Literal["clone", "zeros", "empty"] = "clone",
+    ) -> State:
         """
         Create and return a new :class:`State` object for this model.
-
-        The returned state is initialized with the initial configuration from the model description.
 
         Args:
             requires_grad: Whether the state variables should have `requires_grad` enabled.
                 If None, uses the model's :attr:`requires_grad` setting.
+            copy: How to initialize the configuration arrays (``particle_q``/``particle_qd``,
+                ``body_q``/``body_qd``, ``joint_q``/``joint_qd``):
+
+                - ``"clone"`` (default): copy the initial configuration from the model. Note
+                  that :func:`warp.clone` also copies the source ``.grad`` buffer, so a stale
+                  gradient on the model arrays would propagate into the new state.
+                - ``"zeros"``: zero-initialize (fresh, zeroed ``.grad``).
+                - ``"empty"``: leave uninitialized (fresh, uninitialized ``.grad``).
+
+                For differentiable multi-step rollouts, only the first state needs the initial
+                configuration (``"clone"``); intermediate states are overwritten by the solver,
+                so ``"zeros"``/``"empty"`` avoids redundant copies and prevents gradient leakage
+                across optimization iterations. Force/derived buffers (e.g. ``particle_f``,
+                ``body_f``) are always zero-initialized regardless of this setting.
 
         Returns:
             The state object.
         """
+        if copy == "clone":
+            copy_fn = wp.clone
+        elif copy == "zeros":
+            copy_fn = wp.zeros_like
+        elif copy == "empty":
+            copy_fn = wp.empty_like
+        else:
+            raise ValueError(f"Invalid copy mode {copy!r}; expected 'clone', 'zeros', or 'empty'.")
 
         requested = self.get_requested_state_attributes()
 
@@ -1591,20 +1615,20 @@ class Model:
 
         # particles
         if self.particle_count:
-            s.particle_q = wp.clone(self.particle_q, requires_grad=requires_grad)
-            s.particle_qd = wp.clone(self.particle_qd, requires_grad=requires_grad)
+            s.particle_q = copy_fn(self.particle_q, requires_grad=requires_grad)
+            s.particle_qd = copy_fn(self.particle_qd, requires_grad=requires_grad)
             s.particle_f = wp.zeros_like(self.particle_qd, requires_grad=requires_grad)
 
         # rigid bodies
         if self.body_count:
-            s.body_q = wp.clone(self.body_q, requires_grad=requires_grad)
-            s.body_qd = wp.clone(self.body_qd, requires_grad=requires_grad)
+            s.body_q = copy_fn(self.body_q, requires_grad=requires_grad)
+            s.body_qd = copy_fn(self.body_qd, requires_grad=requires_grad)
             s.body_f = wp.zeros_like(self.body_qd, requires_grad=requires_grad)
 
         # joints
         if self.joint_count:
-            s.joint_q = wp.clone(self.joint_q, requires_grad=requires_grad)
-            s.joint_qd = wp.clone(self.joint_qd, requires_grad=requires_grad)
+            s.joint_q = copy_fn(self.joint_q, requires_grad=requires_grad)
+            s.joint_qd = copy_fn(self.joint_qd, requires_grad=requires_grad)
 
         if "body_qdd" in requested:
             s.body_qdd = wp.zeros_like(self.body_qd, requires_grad=requires_grad)

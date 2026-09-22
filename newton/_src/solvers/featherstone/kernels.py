@@ -16,6 +16,7 @@ from ...sim.articulation import (
     transform_3d_rotational_axes,
 )
 from ..semi_implicit.kernels_body import joint_force
+from ..semi_implicit.kernels_contact import FRICTION_CAP_TOTAL, eval_contact_kinematics
 
 
 @wp.kernel
@@ -432,6 +433,12 @@ def jcalc_tau(
             drive_f = joint_force(
                 q, qd, target_pos, target_vel, target_ke, target_kd, lower, upper, limit_ke, limit_kd, damping
             )
+            # Actuator saturation: clamp the PD drive torque to the joint's effort limit. Real actuators
+            # saturate, and featherstone otherwise IGNORES joint_effort_limit (a correctness gap). This also
+            # bounds the gradient -- a saturated drive has zero gradient w.r.t. the position target, so a
+            # violent command (huge PD error, e.g. a randomized-init env driving 240 N*m through a 80 N*m
+            # ANYmal actuator) can no longer explode the BPTT-through-contact gradient. Default
+            # effort_limit=1e6 -> no-op for EFFORT-control envs (their torque is in joint_f, left unclamped).
             eff = joint_effort_limit[j]
             drive_f = wp.clamp(drive_f, -eff, eff)
 
@@ -1204,6 +1211,14 @@ def eval_rigid_tau(
         torque_com = wp.spatial_bottom(f_ext_public)
         x_com_s = wp.transform_get_translation(body_q_com[child]) - body_solve_origin[child]
         f_ext = -wp.spatial_vector(force, torque_com + wp.cross(x_com_s, force))
+        # GRADIENT BUG (do NOT restore this in-place write): overwriting body_f_ext[child] with the
+        # converted/negated wrench makes warp's reverse tape replay the contact adjoint against the
+        # OVERWRITTEN value -- `force` in the backward of cross(x_com_s, force) becomes -force,
+        # sign-flipping d(wrench)/d(x_com) and corrupting the configuration part of the contact
+        # transition Jacobian (anti-correlated friction gradient at depth; grounded BPTT grad vs dflex
+        # went cos 0.58 -> 0.99 once this write was removed). f_ext is consumed locally below; body_f_ext
+        # is left holding the original COM-frame wrench and compute_body_parent_f re-derives f_ext
+        # out-of-place from it. (was: `body_f_ext[child] = f_ext`)
         f_s = f_b_s + f_t_s + f_ext
 
         # compute joint-space forces, writes out tau
@@ -1283,6 +1298,381 @@ def eval_rigid_jacobian(
 
 
 @wp.func
+def contact_point_jacobian_column(
+    body: int,
+    point: wp.vec3,
+    column: int,
+    dof_count: int,
+    J_start: int,
+    body_jacobian_row: wp.array[int],
+    body_solve_origin: wp.array[wp.vec3],
+    J: wp.array[float],
+):
+    """Return one generalized-velocity column of a body's contact-point Jacobian.
+
+    ``J`` is the articulation spatial Jacobian (rows ``[linear@solve_origin; angular]`` per body, see
+    :func:`eval_rigid_jacobian`), and all bodies of an articulation share one ``body_solve_origin``, so
+    the world point velocity is ``linear + angular x (point - solve_origin)`` -- the same frame map
+    ``eval_rigid_id`` uses for the solve-frame twist.
+    """
+    row = body_jacobian_row[body] * 6
+    linear = wp.vec3(
+        J[J_start + dense_index(dof_count, row + 0, column)],
+        J[J_start + dense_index(dof_count, row + 1, column)],
+        J[J_start + dense_index(dof_count, row + 2, column)],
+    )
+    angular = wp.vec3(
+        J[J_start + dense_index(dof_count, row + 3, column)],
+        J[J_start + dense_index(dof_count, row + 4, column)],
+        J[J_start + dense_index(dof_count, row + 5, column)],
+    )
+    return linear + wp.cross(angular, point - body_solve_origin[body])
+
+
+@wp.func
+def relative_contact_jacobian_column(
+    column: int,
+    body_a: int,
+    point_a: wp.vec3,
+    body_b: int,
+    point_b: wp.vec3,
+    dof_count: int,
+    J_start: int,
+    body_jacobian_row: wp.array[int],
+    body_solve_origin: wp.array[wp.vec3],
+    J: wp.array[float],
+):
+    """One column of the relative contact-point velocity Jacobian J_rel (the full 3-vector, NOT yet split
+    into normal/tangential). A body index < 0 (world, kinematic, or a different articulation) is skipped,
+    so this serves both the coupled same-articulation block (both bodies present) and a single-body
+    diagonal block (one body present). The relative sign of body B is irrelevant to J^T J."""
+    col = wp.vec3(0.0)
+    if body_a >= 0:
+        col += contact_point_jacobian_column(
+            body_a, point_a, column, dof_count, J_start, body_jacobian_row, body_solve_origin, J
+        )
+    if body_b >= 0:
+        col -= contact_point_jacobian_column(
+            body_b, point_b, column, dof_count, J_start, body_jacobian_row, body_solve_origin, J
+        )
+    return col
+
+
+@wp.func
+def accumulate_contact_block(
+    articulation: int,
+    body_a: int,
+    point_a: wp.vec3,
+    body_b: int,
+    point_b: wp.vec3,
+    n: wp.vec3,
+    scale_n: float,
+    scale_t: float,
+    body_jacobian_row: wp.array[int],
+    articulation_J_start: wp.array[int],
+    articulation_H_start: wp.array[int],
+    articulation_H_rows: wp.array[int],
+    body_solve_origin: wp.array[wp.vec3],
+    J: wp.array[float],
+    # output: the effective inertia H_eff (pre-initialized to H_base), accumulated in place
+    H_eff: wp.array[float],
+):
+    """Accumulate ``scale_n * J_n^T J_n + scale_t * J_t^T J_t`` into one articulation's dense inertia
+    block, where ``J_n = n^T J_rel`` (normal contact damping) and ``J_t = (I - nn^T) J_rel`` (tangential
+    viscous friction) split the relative contact-point Jacobian into its along-normal and off-normal
+    parts.
+
+    The FULL (symmetric) block is written, mirroring the dense gemm that fills ``H`` -- the linear
+    solve's reverse pass touches both triangles, so filling both makes the gradient (which flows from
+    ``H_eff`` back into ``J`` and the contact points) aggregate over both triangles, as for ``H``. Only a
+    contact body's ancestor-dof columns are nonzero in ``J`` (the rest are exact zeros from
+    :func:`eval_rigid_jacobian`), so off-chain entries contribute nothing.
+    """
+    dof_count = articulation_H_rows[articulation]
+    J_start = articulation_J_start[articulation]
+    H_start = articulation_H_start[articulation]
+    for i in range(dof_count):
+        col_i = relative_contact_jacobian_column(
+            i, body_a, point_a, body_b, point_b, dof_count, J_start, body_jacobian_row, body_solve_origin, J
+        )
+        ndot_i = wp.dot(n, col_i)
+        tan_i = col_i - n * ndot_i
+        for j in range(dof_count):
+            col_j = relative_contact_jacobian_column(
+                j, body_a, point_a, body_b, point_b, dof_count, J_start, body_jacobian_row, body_solve_origin, J
+            )
+            ndot_j = wp.dot(n, col_j)
+            tan_j = col_j - n * ndot_j
+            wp.atomic_add(
+                H_eff,
+                H_start + dense_index(dof_count, i, j),
+                scale_n * ndot_i * ndot_j + scale_t * wp.dot(tan_i, tan_j),
+            )
+
+
+@wp.kernel
+def eval_implicit_contact_friction(
+    body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+    body_com: wp.array[wp.vec3],
+    body_flags: wp.array[wp.int32],
+    shape_material_ke: wp.array[float],
+    shape_material_kd: wp.array[float],
+    shape_material_kf: wp.array[float],
+    shape_material_ka: wp.array[float],
+    shape_material_mu: wp.array[float],
+    shape_body: wp.array[int],
+    body_articulation: wp.array[int],
+    body_jacobian_row: wp.array[int],
+    articulation_J_start: wp.array[int],
+    articulation_H_start: wp.array[int],
+    articulation_H_rows: wp.array[int],
+    body_solve_origin: wp.array[wp.vec3],
+    J: wp.array[float],
+    contact_count: wp.array[int],
+    contact_point0: wp.array[wp.vec3],
+    contact_point1: wp.array[wp.vec3],
+    contact_normal: wp.array[wp.vec3],
+    contact_shape0: wp.array[int],
+    contact_shape1: wp.array[int],
+    contact_margin0: wp.array[float],
+    contact_margin1: wp.array[float],
+    rigid_contact_stiffness: wp.array[float],
+    rigid_contact_damping: wp.array[float],
+    rigid_contact_friction_scale: wp.array[float],
+    friction_smoothing: float,
+    dt: float,
+    # output: the effective inertia H_eff, pre-initialized to the cached base inertia H_base before this
+    # launch; this kernel accumulates dt * sum (kd*(-d) J_n^T J_n + kf J_t^T J_t) into it in place.
+    H_eff: wp.array[float],
+):
+    """Fold the velocity-linear branches of rigid contact into the generalized inertia (backward Euler),
+    ``H_eff = H_base + dt * sum_contacts [ kd*(-d) J_n^T J_n  +  kf J_t^T J_t ]``, then the caller
+    factors/solves the symmetric system. Two contributions, both implicit-ONLY (euler never launches this
+    kernel, so its behavior is unchanged):
+
+    1. NORMAL damping (``J_n = n^T J_rel``): the backward-Euler form of ``eval_body_contact``'s normal
+       damping ``fd = kd*(-d)*min(vn,0)`` (same kd, same depth scaling). Explicitly this term is
+       stability-limited (a stiff foot impact needs large kd, which would blow up under euler); folded
+       here it is unconditionally stable, so kd can be raised enough to ABSORB landing impacts instead of
+       rebounding -- the explicit penalty contact's bounce is what made an open-loop trajectory replay
+       slip/topple where a compliant (MuJoCo solref) contact tracks. Added for every penetrating contact
+       on approach (vn<0), independent of the friction branch.
+    2. TANGENTIAL viscous friction (``J_t = (I - nn^T) J_rel``): the linear ``ft = kf*vt`` branch, folded
+       so the per-substep tangent contraction is ``1/(1+dt*lambda)`` (stable) instead of ``1-dt*lambda``
+       -- this is what tames the BPTT gradient for G1's many planted feet. Only the foldable viscous
+       branch (``kf*|vt| <= -mu*fn``); the Coulomb-capped (sliding) branch stays explicit.
+
+    The matching explicit forces (fn+fd, ft) stay in ``joint_tau`` via ``eval_body_contact``; combined
+    with this augmentation each linear branch is integrated by backward Euler (1-DOF friction check:
+    ``v_next = m/(m+dt*kf)*v``).
+
+    The full (exact) gradient is taken: the linear solve's adjoint w.r.t. ``H_eff`` flows back through
+    this accumulation into ``J`` and the contact points and through the H_base copy into the cached
+    inertia, while the velocity->velocity contraction comes from ``H_eff``'s value in the solve plus the
+    explicit forces in ``joint_tau``. FD-verified; pathological near-singular contacts can still produce
+    a large (but correct) gradient -- left for the caller's gradient guard, not masked here.
+
+    Contact set, materials, geometry, and the viscous predicate come from the SHARED
+    :func:`~newton._src.solvers.semi_implicit.kernels_contact.eval_contact_kinematics`, so they are
+    identical to the explicit force in ``eval_body_contact`` -- the force and its derivative cannot
+    diverge.
+
+    CROSS-ARTICULATION LIMITATION: the dense solver factors one independent block per articulation, so
+    a contact between two DIFFERENT articulations has no off-diagonal block to fill -- each side gets
+    its own positive diagonal block (a block-Jacobi approximation). Robot-ground contacts (the world
+    side carries no articulation) and contacts within a single articulation are exact.
+    """
+    tid = wp.tid()
+    if tid >= contact_count[0]:
+        return
+
+    # SHARED contact resolution. force_in_world_frame=False matches eval_body_contact's Featherstone
+    # launch (relative point velocity uses the COM lever arm r, not the world point).
+    ck = eval_contact_kinematics(
+        tid,
+        body_q,
+        body_qd,
+        body_com,
+        shape_material_ke,
+        shape_material_kd,
+        shape_material_kf,
+        shape_material_ka,
+        shape_material_mu,
+        shape_body,
+        contact_point0,
+        contact_point1,
+        contact_normal,
+        contact_shape0,
+        contact_shape1,
+        contact_margin0,
+        contact_margin1,
+        rigid_contact_stiffness,
+        rigid_contact_damping,
+        rigid_contact_friction_scale,
+        False,
+    )
+    if not ck.active or ck.d >= 0.0:
+        return
+
+    # NORMAL damping coefficient: backward-Euler fold of eval_body_contact's normal damping. implicitfast
+    # uses the NON-depth-scaled dashpot fd = kd*min(vn,0)*step(d) (see eval_body_contact), so the matching
+    # coefficient is C = kd (constant, NOT kd*(-d)). Active on approach (vn<0). Folding it makes large
+    # (near-critical) kd stable, which is what lets the contact ABSORB impacts instead of rebounding.
+    scale_n = float(0.0)
+    if ck.vn < 0.0:
+        scale_n = dt * ck.kd
+
+    # TANGENTIAL viscous-friction coefficient, identical predicate to eval_body_contact's friction:
+    # ft = (vt/|vt|) * min(kf*|vt|, -mu*fn). The min selects the linear viscous term kf*|vt|
+    # (=> ft = kf*vt, foldable) iff kf*|vt| <= -mu*fn; otherwise Coulomb-capped -> stays explicit.
+    scale_t = float(0.0)
+    speed = wp.length(ck.vt)
+    # NEWTON_FRICTION_CAP_TOTAL=1: same TOTAL-normal-force cap as eval_body_contact's explicit friction
+    # (implicitfast dashpot fd = kd*min(vn,0); d < 0 is guaranteed by the early-out above), so the fold
+    # predicate selects the viscous branch on exactly the contacts whose explicit min() does.
+    cap = -ck.mu * ck.fn
+    if FRICTION_CAP_TOTAL != 0:
+        cap = -ck.mu * (ck.fn + wp.min(ck.vn, 0.0) * ck.kd)
+    if speed > 1.0e-6 * friction_smoothing and ck.kf * speed <= cap:
+        scale_t = dt * ck.kf
+
+    if scale_n == 0.0 and scale_t == 0.0:
+        return
+
+    body_a = ck.body_a
+    body_b = ck.body_b
+    n = ck.n
+
+    articulation_a = int(-1)
+    articulation_b = int(-1)
+    if body_a >= 0 and (body_flags[body_a] & BodyFlags.KINEMATIC) == 0:
+        articulation_a = body_articulation[body_a]
+    if body_b >= 0 and (body_flags[body_b] & BodyFlags.KINEMATIC) == 0:
+        articulation_b = body_articulation[body_b]
+    if articulation_a < 0 and articulation_b < 0:
+        return
+
+    if articulation_a >= 0 and articulation_a == articulation_b:
+        # Both contact bodies in one articulation -> exact coupled relative block.
+        accumulate_contact_block(
+            articulation_a, body_a, ck.bx_a, body_b, ck.bx_b, n, scale_n, scale_t,
+            body_jacobian_row, articulation_J_start, articulation_H_start, articulation_H_rows,
+            body_solve_origin, J, H_eff,
+        )
+    else:
+        # World contact or cross-articulation -> independent positive diagonal block(s).
+        if articulation_a >= 0:
+            accumulate_contact_block(
+                articulation_a, body_a, ck.bx_a, -1, ck.bx_b, n, scale_n, scale_t,
+                body_jacobian_row, articulation_J_start, articulation_H_start, articulation_H_rows,
+                body_solve_origin, J, H_eff,
+            )
+        if articulation_b >= 0:
+            accumulate_contact_block(
+                articulation_b, -1, ck.bx_a, body_b, ck.bx_b, n, scale_n, scale_t,
+                body_jacobian_row, articulation_J_start, articulation_H_start, articulation_H_rows,
+                body_solve_origin, J, H_eff,
+            )
+
+
+@wp.kernel
+def eval_implicit_joint_limit(
+    articulation_start: wp.array[int],
+    articulation_end: wp.array[int],
+    articulation_dof_start: wp.array[int],
+    articulation_H_start: wp.array[int],
+    articulation_H_rows: wp.array[int],
+    joint_type: wp.array[int],
+    joint_q_start: wp.array[int],
+    joint_qd_start: wp.array[int],
+    joint_target_q_start: wp.array[int],
+    joint_dof_dim: wp.array2d[int],
+    joint_q: wp.array[float],
+    joint_qd: wp.array[float],
+    joint_target_q: wp.array[float],
+    joint_target_qd: wp.array[float],
+    joint_target_ke: wp.array[float],
+    joint_target_kd: wp.array[float],
+    joint_limit_lower: wp.array[float],
+    joint_limit_upper: wp.array[float],
+    joint_limit_ke: wp.array[float],
+    joint_limit_kd: wp.array[float],
+    joint_damping: wp.array[float],
+    joint_effort_limit: wp.array[float],
+    dt: float,
+    # outputs (accumulated in place; mirror the contact-friction fold's H_eff accumulation)
+    H_eff: wp.array[float],
+    tau: wp.array[float],
+):
+    """implicitfast ONLY: backward-Euler fold of the ACTIVE, UNSATURATED hard joint-limit spring/damper
+    into the dense generalized inertia H_eff -- the joint-space analogue of ``eval_implicit_contact_friction``.
+
+    The hard joint limit (``kernels_body.joint_force``) applies an explicit penalty ``limit_ke*(limit - q)``
+    plus a damper ``-limit_kd*qd`` whenever q is past a limit. Integrated EXPLICITLY (as euler does, and as
+    implicitfast did before this kernel), that stiff spring on a light distal link is an EXPANSIVE BPTT mode
+    -- the per-substep velocity tangent is ``1 - dt^2*limit_ke/m`` whose magnitude exceeds 1, so the adjoint
+    grows geometrically over H*substeps (the G1 epoch-1 inf: an ankle-roll driven ~0.01 rad past its limit;
+    no contact involved). Folding the velocity-linear part by backward Euler makes the per-substep velocity
+    contraction ``m/(m + dt^2*limit_ke + dt*limit_kd) < 1`` (unconditionally stable), exactly as the
+    contact-friction fold tames the planted-foot gradient.
+
+    For each revolute/prismatic/D6 DOF whose limit is violated (q<lower or q>upper) AND whose joint_force is
+    NOT effort-saturated (a clamped force has zero tangent -> ``jcalc_tau``'s clamp already bounds it, so
+    folding it would over-stiffen), add ``dt*limit_kd + dt^2*limit_ke`` to the H_eff diagonal and subtract
+    ``dt*limit_ke*qd`` from tau -- the ``q_{n+1}=q_n+dt*qd_{n+1}`` spring-velocity coupling, the only RHS
+    term not already in the explicit force ``jcalc_tau`` left in tau. The active+unsaturated predicate and
+    all inputs mirror ``jcalc_tau`` exactly, so the folded force and its tangent cannot diverge from the
+    explicit one. euler never launches this kernel -> its trajectory and gradient are byte-identical.
+    """
+    index = wp.tid()  # one thread per articulation
+    H_start = articulation_H_start[index]
+    H_rows = articulation_H_rows[index]
+    dof_base = articulation_dof_start[index]
+    start = articulation_start[index]
+    end = articulation_end[index]
+
+    for i in range(start, end):
+        type = joint_type[i]
+        if type == JointType.PRISMATIC or type == JointType.REVOLUTE or type == JointType.D6:
+            dof_start = joint_qd_start[i]
+            coord_start = joint_q_start[i]
+            target_q_start = joint_target_q_start[i]
+            axis_count = joint_dof_dim[i, 0] + joint_dof_dim[i, 1]
+            for a in range(axis_count):
+                j = dof_start + a
+                q = joint_q[coord_start + a]
+                qd = joint_qd[j]
+                lower = joint_limit_lower[j]
+                upper = joint_limit_upper[j]
+                if q < lower or q > upper:
+                    limit_ke = joint_limit_ke[j]
+                    limit_kd = joint_limit_kd[j]
+                    # Recompute the (unclamped) joint force to test effort saturation; identical inputs to
+                    # jcalc_tau so this matches the value it clamps. When the limit is violated joint_force
+                    # zeroes the target PD term, so this is limit + limit-damper + passive damping.
+                    drive_f = joint_force(
+                        q,
+                        qd,
+                        joint_target_q[target_q_start + a],
+                        joint_target_qd[j],
+                        joint_target_ke[j],
+                        joint_target_kd[j],
+                        lower,
+                        upper,
+                        limit_ke,
+                        limit_kd,
+                        joint_damping[j],
+                    )
+                    if wp.abs(drive_f) < joint_effort_limit[j]:  # UNSATURATED -> nonzero limit tangent
+                        local = j - dof_base
+                        wp.atomic_add(
+                            H_eff, H_start + dense_index(H_rows, local, local), dt * limit_kd + dt * dt * limit_ke
+                        )
+                        wp.atomic_add(tau, j, -dt * limit_ke * qd)
+
+
+@wp.func
 def spatial_mass(
     body_I_s: wp.array[wp.spatial_matrix],
     joint_start: int,
@@ -1318,6 +1708,42 @@ def eval_rigid_mass(
     M_offset = articulation_M_start[index]
 
     spatial_mass(body_I_s, joint_start, joint_count, M_offset, M)
+
+
+@wp.func
+def spatial_mass_blockdiag(
+    body_I_s: wp.array[wp.spatial_matrix],
+    joint_start: int,
+    joint_count: int,
+    M_start: int,
+    # outputs
+    M: wp.array[float],
+):
+    # COMPACT block-diagonal store: only the joint_count 6x6 diagonal blocks (body spatial inertias),
+    # packed contiguously as M[M_start + l*36 + i*6 + j]. This is the (num_joints*6, 6) layout the tile
+    # GEMM reads (body l at rows [l*6:l*6+6]); 30x smaller than the dense (6*nj)^2 mass matrix, which is
+    # 96% zeros. The off-diagonal coupling lives in the Jacobian J, not M, so nothing is lost.
+    for l in range(joint_count):
+        I = body_I_s[joint_start + l]
+        for i in range(6):
+            for j in range(6):
+                M[M_start + l * 36 + i * 6 + j] = I[i, j]
+
+
+@wp.kernel
+def eval_rigid_mass_blockdiag(
+    articulation_start: wp.array[int],
+    articulation_end: wp.array[int],
+    articulation_M_start: wp.array[int],
+    body_I_s: wp.array[wp.spatial_matrix],
+    # outputs
+    M: wp.array[float],
+):
+    # one thread per-articulation; writes the COMPACT block-diagonal mass matrix (use_tile_gemm path).
+    index = wp.tid()
+    joint_start = articulation_start[index]
+    joint_count = articulation_end[index] - joint_start
+    spatial_mass_blockdiag(body_I_s, joint_start, joint_count, articulation_M_start[index], M)
 
 
 @wp.func
@@ -1389,29 +1815,56 @@ def create_inertia_matrix_kernel(num_joints, num_dofs):
     def eval_dense_gemm_tile(J_arr: wp.array3d[float], M_arr: wp.array3d[float], H_arr: wp.array3d[float]):
         articulation = wp.tid()
 
-        J = wp.tile_load(J_arr[articulation], shape=(wp.static(6 * num_joints), num_dofs))
-        P = wp.tile_zeros(shape=(wp.static(6 * num_joints), num_dofs), dtype=float)
+        # H = J^T M J, where M is block-diagonal in 6x6 inertia blocks (one per body), so
+        #   H = sum_body J_body^T M_body J_body.
+        # Accumulate body-by-body: only a 6 x num_dofs Jacobian slice (and J_body^T M_body) plus the
+        # num_dofs x num_dofs accumulator are ever live in shared memory. Materializing the full
+        # (6*num_joints) x num_dofs J and P tiles overflowed the GPU shared-memory cap in the BACKWARD
+        # pass (the adjoint also holds J/P gradients); the blocked form keeps both passes within budget.
+        #
+        # Associate as (J_body^T M_body) J_body, NOT J_body^T (M_body J_body). The latter form
+        # (P = M_body J_body; H += J_body^T P) tickles a Warp tile-autodiff aliasing bug: when the same
+        # loaded J_body tile feeds one matmul as the 2nd operand (M_body J_body) and another as the
+        # transposed 1st operand (J_body^T P), the adjoint of the OTHER operand (M_body) is accumulated
+        # twice -> dH/dM is 2x too large (dH/dJ stays correct). Computing Q = J_body^T M_body first and
+        # then H += Q J_body avoids that aliasing and yields the correct adjoints for both J and M.
+        H = wp.tile_zeros(shape=(num_dofs, num_dofs), dtype=float)
 
-        # compute P = M*J where M is a 6x6 block diagonal mass matrix
         for i in range(int(num_joints)):
-            # 6x6 block matrices are on the diagonal
-            M_body = wp.tile_load(M_arr[articulation], shape=(6, 6), offset=(i * 6, i * 6))
+            # body i's 6x6 spatial inertia, stored COMPACT block-diagonal: M_arr is (num_joints*6, 6)
+            # per articulation, so body i's block is rows [i*6 : i*6+6] (not the dense (i*6, i*6) diagonal).
+            M_body = wp.tile_load(M_arr[articulation], shape=(6, 6), offset=(i * 6, 0))
 
-            # load a 6xN row from the Jacobian
-            J_body = wp.tile_view(J, offset=(i * 6, 0), shape=(6, num_dofs))
+            # the 6 x num_dofs Jacobian rows for body i
+            J_body = wp.tile_load(J_arr[articulation], shape=(6, num_dofs), offset=(i * 6, 0))
 
-            # compute weighted row
-            P_body = wp.tile_matmul(M_body, J_body)
+            # Q_body = J_body^T M_body   (num_dofs x 6)
+            Q_body = wp.tile_matmul(wp.tile_transpose(J_body), M_body)
 
-            # assign to the P slice
-            wp.tile_assign(P, P_body, offset=(i * 6, 0))
-
-        # compute H = J^T*P
-        H = wp.tile_matmul(wp.tile_transpose(J), P)
+            # accumulate H += Q_body J_body = J_body^T M_body J_body
+            wp.tile_matmul(Q_body, J_body, H)
 
         wp.tile_store(H_arr[articulation], H)
 
     return eval_dense_gemm_tile
+
+
+def create_cholesky_kernel(num_dofs):
+    # Tile-API Cholesky of the per-articulation system matrix: L L^T = A + diag(R), one thread BLOCK per
+    # articulation (cooperative) instead of the scalar dense_cholesky's one thread (O(n^3) serial). Produces
+    # the SAME lower-triangular L layout that dense_subs (eval_dense_solve_batched) reads, so it is a drop-in
+    # forward replacement for eval_dense_cholesky_batched on the use_tile_gemm path. enable_backward=False:
+    # dense_cholesky's adjoint is a nop (the H gradient flows through the solve's adj_dense_solve, which reads
+    # the stored L), so no Cholesky backward is needed -- this also skips the wasteful forward-replay.
+    @wp.kernel(enable_backward=False)
+    def eval_tile_cholesky(A_arr: wp.array3d[float], R_arr: wp.array2d[float], L_arr: wp.array3d[float]):
+        articulation = wp.tid()
+        A = wp.tile_load(A_arr[articulation], shape=(num_dofs, num_dofs))
+        R = wp.tile_load(R_arr[articulation], shape=num_dofs)
+        L = wp.tile_cholesky(wp.tile_diag_add(A, R))
+        wp.tile_store(L_arr[articulation], L)
+
+    return eval_tile_cholesky
 
 
 def create_batched_cholesky_kernel(num_dofs):
@@ -1441,25 +1894,25 @@ def create_inertia_matrix_cholesky_kernel(num_joints, num_dofs):
     ):
         articulation = wp.tid()
 
-        J = wp.tile_load(J_arr[articulation], shape=(wp.static(6 * num_joints), num_dofs))
-        P = wp.tile_zeros(shape=(wp.static(6 * num_joints), num_dofs), dtype=float)
+        # H = J^T M J, accumulated body-by-body so only small tiles are live in shared memory; see the
+        # detailed rationale on create_inertia_matrix_kernel above (block-diagonal M, and the
+        # (J_body^T M_body) J_body association that avoids the Warp tile-autodiff adj_M doubling).
+        H = wp.tile_zeros(shape=(num_dofs, num_dofs), dtype=float)
 
-        # compute P = M*J where M is a 6x6 block diagonal mass matrix
         for i in range(int(num_joints)):
-            # 6x6 block matrices are on the diagonal
-            M_body = wp.tile_load(M_arr[articulation], shape=(6, 6), offset=(i * 6, i * 6))
+            # body i's 6x6 spatial inertia, stored COMPACT block-diagonal: M_arr is (num_joints*6, 6)
+            # per articulation, so body i's block is rows [i*6 : i*6+6] (not the dense (i*6, i*6) diagonal).
+            M_body = wp.tile_load(M_arr[articulation], shape=(6, 6), offset=(i * 6, 0))
 
-            # load a 6xN row from the Jacobian
-            J_body = wp.tile_view(J, offset=(i * 6, 0), shape=(6, num_dofs))
+            # the 6 x num_dofs Jacobian rows for body i
+            J_body = wp.tile_load(J_arr[articulation], shape=(6, num_dofs), offset=(i * 6, 0))
 
-            # compute weighted row
-            P_body = wp.tile_matmul(M_body, J_body)
+            # Q_body = J_body^T M_body   (num_dofs x 6)
+            Q_body = wp.tile_matmul(wp.tile_transpose(J_body), M_body)
 
-            # assign to the P slice
-            wp.tile_assign(P, P_body, offset=(i * 6, 0))
+            # accumulate H += Q_body J_body = J_body^T M_body J_body
+            wp.tile_matmul(Q_body, J_body, H)
 
-        # compute H = J^T*P
-        H = wp.tile_matmul(wp.tile_transpose(J), P)
         wp.tile_store(H_arr[articulation], H)
 
         # cholesky L L^T = (H + diag(R))
@@ -1552,7 +2005,7 @@ def adj_dense_cholesky(
     pass
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def eval_dense_cholesky_batched(
     A_starts: wp.array[int],
     A_dim: wp.array[int],
@@ -2225,6 +2678,11 @@ def compute_body_parent_f(
     """
     tid = wp.tid()
 
+    # body_f_ext now holds the ORIGINAL COM-frame external/contact wrench: eval_rigid_tau no longer
+    # overwrites it in-place with the converted/negated wrench (that in-place write corrupted warp's
+    # reverse-mode tape -- it replayed the contact adjoint against the converted value, sign-flipping
+    # d(wrench)/d(x_com)). So apply the same COM->solve-frame negation here, OUT-OF-PLACE, to reproduce
+    # eval_rigid_tau's f_ext (the negated sign convention documented above).
     r_com = wp.transform_get_translation(body_q_com[tid]) - body_solve_origin[tid]
     f_ext_public = body_f_ext[tid]
     ext_force = wp.spatial_top(f_ext_public)
